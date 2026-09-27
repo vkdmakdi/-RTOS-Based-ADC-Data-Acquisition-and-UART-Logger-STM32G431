@@ -1,249 +1,291 @@
-#include "main.h"
+#include "stm32g4xx.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
+#include "FreeRTOSConfig.h"
+#include <stdint.h>
+
+#define RCC_REG_BASE            0x40021000U
+#define RCC_AHB1ENR_REG     (*(volatile uint32_t *)(RCC_REG_BASE + 0x48U))
+#define RCC_AHB2ENR_REG     (*(volatile uint32_t *)(RCC_REG_BASE + 0x4CU))
+#define RCC_APB1ENR1_REG    (*(volatile uint32_t *)(RCC_REG_BASE + 0x58U))
+#define RCC_APB2ENR_REG     (*(volatile uint32_t *)(RCC_REG_BASE + 0x60U))
+#define RCC_CCIPR_REG       (*(volatile uint32_t *)(RCC_REG_BASE + 0x88U))
+
+#define GPIOA_REG_BASE          0x48000000U
+#define GPIOA_MODE_REG      (*(volatile uint32_t *)(GPIOA_REG_BASE + 0x00U))
+#define GPIOA_AFRH_REG      (*(volatile uint32_t *)(GPIOA_REG_BASE + 0x24U))
+#define GPIOA_ASCR_REG      (*(volatile uint32_t *)(GPIOA_REG_BASE + 0x2CU))
+
+#define USART1_REG_BASE         0x40013800U
+#define USART1_CR1_REG      (*(volatile uint32_t *)(USART1_REG_BASE + 0x00U))
+#define USART1_BRR_REG      (*(volatile uint32_t *)(USART1_REG_BASE + 0x0CU))
+#define USART1_ISR_REG      (*(volatile uint32_t *)(USART1_REG_BASE + 0x1CU))
+#define USART1_TDR_REG      (*(volatile uint32_t *)(USART1_REG_BASE + 0x28U))
+
+#define TIM2_REG_BASE           0x40000000U
+#define TIM2_CR1_REG        (*(volatile uint32_t *)(TIM2_REG_BASE + 0x00U))
+#define TIM2_CR2_REG        (*(volatile uint32_t *)(TIM2_REG_BASE + 0x04U))
+#define TIM2_PSC_REG        (*(volatile uint32_t *)(TIM2_REG_BASE + 0x28U))
+#define TIM2_ARR_REG        (*(volatile uint32_t *)(TIM2_REG_BASE + 0x2CU))
+
+#define ADC1_REG_BASE           0x50000000UL
+#define ADC1_ISR_REG        (*(volatile uint32_t *)(ADC1_REG_BASE + 0x00U))
+#define ADC1_CR_REG         (*(volatile uint32_t *)(ADC1_REG_BASE + 0x08U))
+#define ADC1_CFGR_REG       (*(volatile uint32_t *)(ADC1_REG_BASE + 0x0CU))
+#define ADC1_SQR1_REG       (*(volatile uint32_t *)(ADC1_REG_BASE + 0x30U))
+#define ADC1_DR_REG         (*(volatile uint32_t *)(ADC1_REG_BASE + 0x40U))
+
+#define DMA1_REG_BASE           0x40020000U
+#define DMAMUX1_REG_BASE        0x40020800U
+#define DMA1_ISR_REG        (*(volatile uint32_t *)(DMA1_REG_BASE + 0x00U))
+#define DMA1_IFCR_REG       (*(volatile uint32_t *)(DMA1_REG_BASE + 0x04U))
+#define DMA1_CCR1_REG       (*(volatile uint32_t *)(DMA1_REG_BASE + 0x08U))
+#define DMA1_CNDTR1_REG     (*(volatile uint32_t *)(DMA1_REG_BASE + 0x0CU))
+#define DMA1_CPAR1_REG      (*(volatile uint32_t *)(DMA1_REG_BASE + 0x10U))
+#define DMA1_CMAR1_REG      (*(volatile uint32_t *)(DMA1_REG_BASE + 0x14U))
+#define DMAMUX1_C0CR_REG    (*(volatile uint32_t *)(DMAMUX1_REG_BASE + 0x00U))
 
 #define PACKET_SYNC         '#'
-#define PAYLOAD_SIZE        8
-#define PACKET_SIZE         (1 + PAYLOAD_SIZE + 1)
+#define PAYLOAD_SIZE        8U
+#define PACKET_SIZE         (1U + PAYLOAD_SIZE + 1U)
+#define ADC_BUFFER_LENGTH   8U
+#define PACKETS_PER_QUEUE   8U
+#define ADC_EVENT_HALF      (1UL << 0)
+#define ADC_EVENT_FULL      (1UL << 1)
+#define ADC_EVENT_MASK      (ADC_EVENT_HALF | ADC_EVENT_FULL)
 
-uint16_t adc_ring_buffer[8];
-uint8_t tx_buffer[PACKET_SIZE];
 
-//global traxkers
-volatile uint8_t half_buffer_ready = 0;
-volatile uint8_t full_buffer_ready = 0;
+/* One ADC channel sampled at 1 kHz; each packet contains four consecutive samples. */
+static volatile uint16_t adc_ring_buffer[ADC_BUFFER_LENGTH];
 
-void SystemClock_Config(void);
-static void MX_GPIO_Init(void);
-static void USART2_WriteChar(char c);
-static void suwi(void);
+typedef struct
+{
+    uint16_t samples[4];
+} AdcPacket_t;
+
+static QueueHandle_t packetQueue;
+TaskHandle_t adcTaskHandle = NULL;
+static volatile uint32_t droppedPacketCount;
+volatile uint32_t dmaErrorCount;
+
+void Error_Handler(void);
+static void system_init(void);
 static void adc_calibrate(void);
-static void Send_Packet_From_Buffer(uint16_t *src_buffer);
+static void acquisition_task(void *argument);
+static void uart_task(void *argument);
+static void send_packet(const AdcPacket_t *packet);
+static void uart_write_byte(uint8_t byte);
 
 int main(void)
 {
-  HAL_Init();
-  SystemClock_Config();
-  MX_GPIO_Init();
-  suwi();
+    system_init();
 
-  // start adc and timer
-  ADC1->CR |= ADC_CR_ADSTART;
-  TIM1->CR1 |= TIM_CR1_CEN;
+    packetQueue = xQueueCreate(PACKETS_PER_QUEUE, sizeof(AdcPacket_t));
+    if (packetQueue == NULL)
+    {
+        Error_Handler();
+    }
 
-  while (1)
-  {
-      if (half_buffer_ready)
-      {
-          half_buffer_ready = 0;
-          Send_Packet_From_Buffer(&adc_ring_buffer[0]); // First 4 elements
-      }
+    if (xTaskCreate(acquisition_task, "adc", 256U, NULL,
+                    tskIDLE_PRIORITY + 3U, &adcTaskHandle) != pdPASS)
+    {
+        Error_Handler();
+    }
 
-      if (full_buffer_ready)
-      {
-          full_buffer_ready = 0;
-          Send_Packet_From_Buffer(&adc_ring_buffer[4]); // Last 4 elements
-      }
-  }
-}
+    if (xTaskCreate(uart_task, "uart", 256U, NULL,
+                    tskIDLE_PRIORITY + 2U, NULL) != pdPASS)
+    {
+        Error_Handler();
+    }
 
-void SystemClock_Config(void)
-{
-  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-  HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV4;
-  RCC_OscInitStruct.PLL.PLLN = 85;
-  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-  RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
-  RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
+    vTaskStartScheduler();
     Error_Handler();
-  }
-
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
-  {
-    Error_Handler();
-  }
+    return 0;
 }
 
-static void MX_GPIO_Init(void)
+static void acquisition_task(void *argument)
 {
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOF_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
+    (void) argument;
 
-  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+    /* Start sampling only after the task handle is ready for DMA notifications. */
+    TIM2_CR1_REG |= (1UL << 0);
 
-  GPIO_InitStruct.Pin = B1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+    for (;;)
+    {
+        uint32_t events = 0U;
+        (void) xTaskNotifyWait(0U, ADC_EVENT_MASK, &events, portMAX_DELAY);
 
-  GPIO_InitStruct.Pin = LD2_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
+        if ((events & ADC_EVENT_HALF) != 0U)
+        {
+            AdcPacket_t packet;
+            for (uint32_t i = 0U; i < 4U; ++i)
+            {
+                packet.samples[i] = adc_ring_buffer[i];
+            }
+            if (xQueueSend(packetQueue, &packet, 0U) != pdPASS)
+            {
+                ++droppedPacketCount;
+            }
+        }
+
+        if ((events & ADC_EVENT_FULL) != 0U)
+        {
+            AdcPacket_t packet;
+            for (uint32_t i = 0U; i < 4U; ++i)
+            {
+                packet.samples[i] = adc_ring_buffer[i + 4U];
+            }
+            if (xQueueSend(packetQueue, &packet, 0U) != pdPASS)
+            {
+                ++droppedPacketCount;
+            }
+        }
+    }
 }
 
-static void USART2_WriteChar(char c)
+static void uart_task(void *argument)
 {
-    while(!(USART2->ISR & USART_ISR_TXE_TXFNF));
-    USART2->TDR = c;
+    (void) argument;
+    AdcPacket_t packet;
+
+    for (;;)
+    {
+        if (xQueueReceive(packetQueue, &packet, portMAX_DELAY) == pdPASS)
+        {
+            send_packet(&packet);
+        }
+    }
+}
+
+static void uart_write_byte(uint8_t byte)
+{
+    while ((USART1_ISR_REG & USART_ISR_TXE) == 0U)
+    {
+
+    }
+    USART1_TDR_REG = byte;
+}
+
+static void send_packet(const AdcPacket_t *packet)
+{
+    uint8_t txBuffer[PACKET_SIZE];
+    uint8_t checksum = 0U;
+    uint32_t byteIndex = 1U;
+
+    txBuffer[0] = (uint8_t) PACKET_SYNC;
+
+    for (uint32_t i = 0U; i < 4U; ++i)
+    {
+        const uint16_t sample = packet->samples[i];
+        const uint8_t lowByte = (uint8_t) (sample & 0xFFU);
+        const uint8_t highByte = (uint8_t) (sample >> 8U);
+
+        txBuffer[byteIndex++] = lowByte;
+        txBuffer[byteIndex++] = highByte;
+        checksum ^= lowByte;
+        checksum ^= highByte;
+    }
+
+    txBuffer[PACKET_SIZE - 1U] = checksum;
+    for (uint32_t i = 0U; i < PACKET_SIZE; ++i)
+    {
+        uart_write_byte(txBuffer[i]);
+    }
 }
 
 static void adc_calibrate(void)
 {
-    ADC1->CR &= ~ADC_CR_DEEPPWD;
-    ADC1->CR |= ADC_CR_ADVREGEN;
-    for (volatile int i = 0; i < 3000; i++) { }
+    ADC1_CR_REG &= ~(1UL << 29U); /* DEEPPWD = 0 */
+    ADC1_CR_REG |=  (1UL << 28U); /* ADVREGEN = 1 */
+    for (volatile uint32_t i = 0U; i < 1000U; ++i) { }
 
-    ADC1->CR |= ADC_CR_ADCAL;
-    while (ADC1->CR & ADC_CR_ADCAL);
+    ADC1_CR_REG |= (1UL << 31U); /* ADCAL = 1 */
+    while ((ADC1_CR_REG & (1UL << 31U)) != 0U) { }
 }
 
-static void suwi(void)
+static void system_init(void)
 {
-    RCC->PLLCFGR |= (8U << RCC_PLLCFGR_PLLPDIV_Pos) | (RCC_PLLCFGR_PLLPEN);
+    /* System clock remains the reset HSI clock (16 MHz). */
+    RCC_AHB1ENR_REG |= (1UL << 0U);   /* DMA1 */
+    RCC_AHB2ENR_REG |= (1UL << 0U);   /* GPIOA */
+    RCC_AHB2ENR_REG |= (1UL << 13U);  /* ADC12 */
+    RCC_APB1ENR1_REG |= (1UL << 0U);  /* TIM2 */
+    RCC_APB2ENR_REG |= (1UL << 14U);  /* USART1 */
 
-    RCC->AHB1ENR |= RCC_AHB1ENR_DMA1EN | RCC_AHB1ENR_DMAMUX1EN;
-    RCC->AHB2ENR  |= RCC_AHB2ENR_ADC12EN;
-    RCC->AHB2ENR  |= RCC_AHB2ENR_GPIOAEN;
-    RCC->APB1ENR1 |= RCC_APB1ENR1_USART2EN;
-    RCC->APB2ENR  |= RCC_APB2ENR_TIM1EN;
+    /* ADC12SEL=2 selects SYSCLK; 3 is reserved on STM32G4. */
+    RCC_CCIPR_REG = (RCC_CCIPR_REG & ~(3UL << 28U)) | (2UL << 28U);
 
-    RCC->CCIPR &= ~(RCC_CCIPR_ADC12SEL);
-    RCC->CCIPR |=  (1U << RCC_CCIPR_ADC12SEL_Pos);
+    /* PA9 = USART1_TX (AF7); PA10 = USART1_RX (AF7). */
+    GPIOA_MODE_REG = (GPIOA_MODE_REG & ~((3UL << 18U) | (3UL << 20U)))
+                   | ((2UL << 18U) | (2UL << 20U));
+    GPIOA_AFRH_REG = (GPIOA_AFRH_REG & ~((15UL << 4U) | (15UL << 8U)))
+                   | ((7UL << 4U) | (7UL << 8U));
 
-    GPIOA->MODER  &= ~(3UL << (2 * 2));
-    GPIOA->MODER  |=  (2UL << (2 * 2));
-    GPIOA->AFR[0] &= ~(0xFU << (4 * 2));
-    GPIOA->AFR[0] |=  (0x7U << (4 * 2));
+    /* PA0 = ADC1 channel 1. */
+    GPIOA_MODE_REG = (GPIOA_MODE_REG & ~(3UL << 0U)) | (3UL << 0U);
+    GPIOA_ASCR_REG |= (1UL << 0U);
 
-    USART2->BRR = 16;
-    USART2->CR1 |= USART_CR1_TE;
-    USART2->CR1 |= USART_CR1_UE;
+    /* USART1 at approximately 115200 baud from the 16 MHz HSI clock. */
+    USART1_BRR_REG = 139U;
+    USART1_CR1_REG |= (1UL << 3U) | (1UL << 0U); /* TE | UE */
 
-    // Clear and set PA0 to Analog Mode
-    GPIOA->MODER &= ~(3UL << (2 * 0));
-    GPIOA->MODER |=  (3UL << (2 * 0));
+    /* TIM2 update at 1 kHz: 16 MHz / 16 / 1000. */
+    TIM2_PSC_REG = 16U - 1U;
+    TIM2_ARR_REG = 1000U - 1U;
+    TIM2_CR2_REG = (TIM2_CR2_REG & ~(7UL << 4U)) | (2UL << 4U); /* TRGO=update */
+    TIM2_CR1_REG &= ~(1UL << 0U); /* Start in acquisition_task. */
 
-    // Clear DMA flag status bits
-    DMA1->IFCR = DMA_IFCR_CTCIF1 | DMA_IFCR_CHTIF1;
+    /* ADC DMA circular buffer: four samples per half-buffer. */
+    DMA1_CCR1_REG &= ~(1UL << 0U);
+    DMA1_CPAR1_REG = (uint32_t) &ADC1_DR_REG;
+    DMA1_CMAR1_REG = (uint32_t) adc_ring_buffer;
+    DMA1_CNDTR1_REG = ADC_BUFFER_LENGTH;
+    DMA1_IFCR_REG = DMA_IFCR_CTCIF1 | DMA_IFCR_CHTIF1 | DMA_IFCR_CTEIF1;
+    DMA1_CCR1_REG = (1UL << 8U)  /* PSIZE=16 bit */
+                  | (1UL << 10U) /* MSIZE=16 bit */
+                  | (1UL << 7U)  /* MINC */
+                  | (1UL << 5U)  /* CIRC */
+                  | (1UL << 1U)  /* TCIE */
+                  | (1UL << 2U); /* HTIE */
+    DMAMUX1_C0CR_REG = 5U; /* ADC1 request */
 
-    DMA1_Channel1->CCR &= ~DMA_CCR_EN;
-    DMA1_Channel1->CPAR  = (uint32_t)(&(ADC1->DR));
-    DMA1_Channel1->CMAR  = (uint32_t)(adc_ring_buffer);
-    DMA1_Channel1->CNDTR = 8;
-
-    DMA1_Channel1->CCR = 0;
-    DMA1_Channel1->CCR |= (1U << DMA_CCR_PSIZE_Pos); // 16 bit peripheral
-    DMA1_Channel1->CCR |= (1U << DMA_CCR_MSIZE_Pos); // 16 bit memory
-    DMA1_Channel1->CCR |= DMA_CCR_MINC;             // Memory increment
-
-    // Enable circular mode, half flag and full flag
-    DMA1_Channel1->CCR |= DMA_CCR_CIRC | DMA_CCR_TCIE | DMA_CCR_HTIE;
-
-    DMAMUX1_Channel0->CCR = 5; // Route ADC1 to DMA1 channel 1
-
-    // Config DMA interrupt with NVIC
-    NVIC_SetPriority(DMA1_Channel1_IRQn, 1);
+    NVIC_SetPriorityGrouping(NVIC_PRIORITYGROUP_4);
+    NVIC_SetPriority(DMA1_Channel1_IRQn, configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY);
     NVIC_EnableIRQ(DMA1_Channel1_IRQn);
 
-    // Master mode (trigo)
-    TIM1->PSC = 169;
-    TIM1->ARR = 10000; // Trigger every 10ms
-
-    // Config master mode and send uodate through trigo
-    TIM1->CR2 &= ~TIM_CR2_MMS;
-    TIM1->CR2 |= (2U << TIM_CR2_MMS_Pos); // 2 = TRGO on update event
-    TIM1->EGR |= TIM_EGR_UG;              // Force a register update
-
-    // Run calibration
+    /* ADC: single regular conversion on channel 1, triggered by TIM2_TRGO. */
     adc_calibrate();
+    ADC1_CFGR_REG &= ~((31UL << 5U) | (3UL << 10U) | (1UL << 13U)
+                     | (1UL << 0U) | (1UL << 1U));
+    ADC1_CFGR_REG |= (11UL << 5U) | (1UL << 10U) | (1UL << 0U) | (1UL << 1U);
+    ADC1_SQR1_REG = (ADC1_SQR1_REG & ~((15UL << 0U) | (0x1FUL << 6U)))
+                  | (1UL << 6U);
 
-    // Enable the ADC and block until internal analog stability flag trigger
-    ADC1->CR |= ADC_CR_ADEN;
-    while (!(ADC1->ISR & ADC_ISR_ADRDY)) { }
-    ADC1->ISR |= ADC_ISR_ADRDY;
+    ADC1_CR_REG |= (1UL << 0U); /* ADEN */
+    while ((ADC1_ISR_REG & (1UL << 0U)) == 0U) { } /* ADRDY */
+    ADC1_ISR_REG = (1UL << 0U); /* Clear ADRDY. */
 
-    // Apply runtime tracking configurations
-    ADC1->CFGR &= ~(ADC_CFGR_EXTEN | ADC_CFGR_EXTSEL | ADC_CFGR_CONT);
-
-    // EXTSEL = 9 selects TIM1_TRGO for regular channel group
-    ADC1->CFGR |= (9U << ADC_CFGR_EXTSEL_Pos);
-    ADC1->CFGR |= (1U << ADC_CFGR_EXTEN_Pos);  // Detect on rising edge
-    ADC1->CFGR |= ADC_CFGR_DMAEN | ADC_CFGR_DMACFG; // Continuous circular DMA mode
-
-    ADC1->SQR1 = 0;
-    ADC1->SQR1 |= (1U << ADC_SQR1_SQ1_Pos); // Map sequence to Channel 1
-
-    // Activate the DMA channel stream layer
-    DMA1_Channel1->CCR |= DMA_CCR_EN;
+    DMA1_CCR1_REG |= (1UL << 0U); /* Enable DMA before ADC conversions. */
+    ADC1_CR_REG |= (1UL << 2U);   /* ADSTART; TIM2 triggers conversions. */
 }
 
-void DMA1_Channel1_IRQHandler(void)
+void vApplicationMallocFailedHook(void)
 {
-    // Half Transfer Interrupt Handling
-    if (DMA1->ISR & DMA_ISR_HTIF1)
-    {
-        DMA1->IFCR = DMA_IFCR_CHTIF1;
-        half_buffer_ready = 1;
-    }
-
-    // Transfer Complete Interrupt Handling
-    if (DMA1->ISR & DMA_ISR_TCIF1)
-    {
-        DMA1->IFCR = DMA_IFCR_CTCIF1;
-        full_buffer_ready = 1;
-    }
+    taskDISABLE_INTERRUPTS();
+    for (;;) { }
 }
 
-static void Send_Packet_From_Buffer(uint16_t *src_buffer)
+void vApplicationStackOverflowHook(TaskHandle_t task, char *taskName)
 {
-    tx_buffer[0] = PACKET_SYNC;
-    uint8_t checksum = 0;
-    uint8_t byte_idx = 1;
-
-    for (uint8_t i = 0; i < 4; i++)
-    {
-        uint16_t sample = src_buffer[i];
-        uint8_t low_byte  = (uint8_t)(sample & 0xFF);
-        uint8_t high_byte = (uint8_t)((sample >> 8) & 0xFF);
-
-        tx_buffer[byte_idx++] = low_byte;
-        tx_buffer[byte_idx++] = high_byte;
-
-        checksum ^= low_byte;
-        checksum ^= high_byte;
-    }
-
-    tx_buffer[PACKET_SIZE - 1] = checksum;
-
-    for (uint8_t i = 0; i < PACKET_SIZE; i++)
-    {
-        USART2_WriteChar((char)tx_buffer[i]);
-    }
+    (void) task;
+    (void) taskName;
+    taskDISABLE_INTERRUPTS();
+    for (;;) { }
 }
 
 void Error_Handler(void)
 {
-  __disable_irq();
-  while (1)
-  {
-  }
+    __disable_irq();
+    for (;;) { }
 }
