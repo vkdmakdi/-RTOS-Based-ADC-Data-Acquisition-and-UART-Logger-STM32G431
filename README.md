@@ -2,11 +2,6 @@
 
 > Timer-triggered ADC sampling on an STM32G431, with circular DMA, FreeRTOS task notifications and queues, and UART packet output for a Python host decoder.
 
-![MCU](https://img.shields.io/badge/MCU-STM32G431-blue)
-![RTOS](https://img.shields.io/badge/RTOS-FreeRTOS-green)
-![Language](https://img.shields.io/badge/language-C%20%2F%20Python-brightgreen)
-![Status](https://img.shields.io/badge/hardware%20test-pending-orange)
-
 ## Overview
 
 This project acquires analog samples on an STM32G431 (NUCLEO-G431RB target). TIM2 generates a 1 kHz trigger for ADC1, and DMA transfers 16-bit results into an eight-element circular buffer. FreeRTOS separates sample handling from serial output: the DMA interrupt notifies an acquisition task, which copies each completed half-buffer into a queue; a UART task removes packets from that queue and transmits them.
