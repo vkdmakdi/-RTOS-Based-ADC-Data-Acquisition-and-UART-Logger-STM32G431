@@ -42,8 +42,8 @@ def decode_packets(port: str, baud: int = 115200):
 
             samples = struct.unpack('<4H', payload)
 
-            print(f"CH0: {samples[0]:5d}  CH1: {samples[1]:5d}  "
-                  f"CH2: {samples[2]:5d}  CH3: {samples[3]:5d}")
+            print(f"S0: {samples[0]:5d}  S1: {samples[1]:5d}  "
+                  f"S2: {samples[2]:5d}  S3: {samples[3]:5d}")
 
 if __name__ == "__main__":
-    decode_packets(port="COM4", baud=10625000)
+    decode_packets(port="COM4", baud=115200)
