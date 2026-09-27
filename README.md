@@ -1,259 +1,148 @@
-# stm32-adc-dma-uart-logger
+# FreeRTOS ADC DMA UART Logger
 
-> 4-channel ADC data acquisition on STM32G4 using DMA circular buffer and TIM1 triggering, streamed over UART with a Python packet decoder.
+> Timer-triggered ADC sampling on an STM32G431, with circular DMA, FreeRTOS task notifications and queues, and UART packet output for a Python host decoder.
 
 ![MCU](https://img.shields.io/badge/MCU-STM32G431-blue)
-![Language](https://img.shields.io/badge/lang-C%20%2F%20Python-green)
-![Bare Metal](https://img.shields.io/badge/bare%20metal-yes-orange)
-![License](https://img.shields.io/badge/license-MIT-lightgrey)
-
----
-
-## Table of Contents
-
-- [Overview](#overview)
-- [How It Works](#how-it-works)
-- [Packet Structure](#packet-structure)
-- [Hardware](#hardware)
-- [Clock Configuration](#clock-configuration)
-- [Getting Started](#getting-started)
-- [Python Decoder](#python-decoder)
-- [File Structure](#file-structure)
-- [License](#license)
-
----
+![RTOS](https://img.shields.io/badge/RTOS-FreeRTOS-green)
+![Language](https://img.shields.io/badge/language-C%20%2F%20Python-brightgreen)
+![Status](https://img.shields.io/badge/hardware%20test-pending-orange)
 
 ## Overview
 
-This project implements bare-metal ADC data acquisition on the STM32G431 running at 170 MHz. The ADC samples a single analog input at 100 Hz, triggered by TIM1. DMA moves each conversion result into a circular ring buffer without CPU involvement. When half or all of the buffer fills, an interrupt flags the main loop to package and transmit the samples over USART2 as a compact binary packet.
+This project acquires analog samples on an STM32G431 (NUCLEO-G431RB target). TIM2 generates a 1 kHz trigger for ADC1, and DMA transfers 16-bit results into an eight-element circular buffer. FreeRTOS separates sample handling from serial output: the DMA interrupt notifies an acquisition task, which copies each completed half-buffer into a queue; a UART task removes packets from that queue and transmits them.
 
-A Python script on the host side listens on the serial port, re-syncs automatically on packet boundaries, verifies the XOR checksum, and prints all 4 channels continuously.
+Each packet contains four consecutive readings from the single analog input on PA0. The current firmware does not scan four independent ADC channels. The firmware has been build-verified; hardware testing is pending.
 
----
+## Data flow
 
-## How It Works
-
-```
-  PA0 (analog)
-       │
-       ▼
-  ┌─────────┐   every 10ms   ┌─────────┐
-  │  TIM1   │───── TRGO ────▶│  ADC1   │
-  └─────────┘                └────┬────┘
-                                  │ conversion result
-                                  ▼
-                            ┌──────────┐
-                            │  DMA1    │  circular, 16-bit
-                            │  Ch1     │  8-element ring
-                            └────┬─────┘
-                      HTIF │     │ TCIF
-                    ┌───────┘     └───────┐
-                    ▼                     ▼
-             [0..3] ready          [4..7] ready
-                    │                     │
-                    └──────────┬──────────┘
-                               ▼
-                         Send_Packet()
-                               │
-                               ▼
-                        ┌────────────┐
-                        │  USART2    │  115200 baud
-                        └─────┬──────┘
-                               │
-                               ▼
-                        ┌────────────┐
-                        │ decoder.py │  Python host
-                        └────────────┘
+```text
+PA0 analog input
+      |
+      v
+TIM2 TRGO at 1 kHz --> ADC1 channel 1 --> DMA1 Channel 1 circular buffer [8]
+                                                  |
+                                      half/full transfer interrupt
+                                                  |
+                                    FreeRTOS task notification
+                                                  |
+                                  Acquisition task (priority 3)
+                                  copies four readings to queue
+                                                  |
+                                     Packet queue (8 packets)
+                                                  |
+                                     UART task (priority 2)
+                                                  |
+                                      USART1 TX, PA9
+                                                  |
+                                       Host decode.py
 ```
 
-**Step by step:**
+### Firmware sequence
 
-1. **TIM1** is configured with PSC=169 and ARR=10000, producing an Update Event every 10 ms at 170 MHz. Master Mode is set to TRGO on Update Event.
-2. **ADC1** is configured in hardware-triggered mode with EXTSEL=9 (TIM1_TRGO on STM32G4), rising edge detect. Each TRGO pulse starts one conversion on Channel 1 (PA0).
-3. **DMA1 Channel 1** is routed from ADC1 via DMAMUX (slot 5). It runs in circular mode writing 16-bit results into `adc_ring_buffer[8]`.
-4. At the **half-transfer** (elements 0–3 filled) and **transfer-complete** (elements 4–7 filled), the DMA IRQ sets a flag.
-5. The **main loop** polls those flags and calls `Send_Packet_From_Buffer()` with a pointer to the ready half.
-6. `Send_Packet_From_Buffer()` builds a 10-byte framed packet and sends it byte-by-byte over USART2.
+1. TIM2 uses `PSC=15` and `ARR=999` with the 16 MHz HSI clock, producing a 1 kHz update/TRGO.
+2. ADC1 converts PA0 (ADC channel 1) on each TIM2 trigger. ADC12 uses SYSCLK as its kernel clock.
+3. DMA1 Channel 1 writes each result into an eight-element, 16-bit circular buffer.
+4. On half-transfer and transfer-complete events, the DMA ISR clears the flag and notifies the acquisition task. It does not format or transmit data inside the ISR.
+5. The acquisition task copies the ready four-sample region into a packet and sends it to a FreeRTOS queue. If the queue is full, the packet is dropped and a counter is incremented.
+6. The UART task is the only task that writes packet bytes to USART1.
 
----
+The two DMA notifications arrive alternately every four samples, or every 4 ms at 1 kHz. This produces up to 250 packets per second.
 
-## Packet Structure
+## Packet format
 
-Each transmission is exactly 10 bytes:
+Each packet is 10 bytes:
 
-```
- Byte  0     1     2     3     4     5     6     7     8     9
-      ┌─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┐
-      │  #  │ L0  │ H0  │ L1  │ H1  │ L2  │ H2  │ L3  │ H3  │ XOR │
-      └─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┘
-        ^     └──── CH0 ────┘  └──── CH1 ────┘  └──── CH2 ────┘  ^
-      Sync       uint16 LE         uint16 LE         uint16 LE   Checksum
-      0x23                                                    XOR of bytes 1–8
-```
+| Byte(s) | Value |
+|---|---|
+| 0 | Sync byte `0x23` (`#`) |
+| 1–8 | Four unsigned 16-bit samples, little-endian |
+| 9 | XOR of payload bytes 1–8 |
 
-- **Sync byte**: always `0x23` (`#`) — used to find packet boundaries
-- **Samples**: 4 × uint16, little-endian (low byte first, then high byte)
-- **Checksum**: XOR of all 8 payload bytes (bytes 1 through 8)
-- **Total size**: 10 bytes per packet, 2 packets per DMA cycle = 20 bytes per 8 samples
-
----
+The decoder prints these values as `S0` through `S3`; they are four successive samples from PA0, not four separate channels.
 
 ## Hardware
 
-| Pin | Function |
-|-----|----------|
-| PA0 | ADC1 Channel 1 — analog input (0 to 3.3 V) |
-| PA2 | USART2 TX — connect to USB-UART adapter RX |
-| GND | Common ground with USB-UART adapter |
+| Pin/peripheral | Use |
+|---|---|
+| PA0 | ADC1 channel 1 analog input, 0–3.3 V |
+| PA9 | USART1 TX; connect to USB-UART adapter RX |
+| PA10 | USART1 RX pin configured by firmware; unused by this logger |
+| GND | Common ground between the board and USB-UART adapter |
+| TIM2 | 1 kHz update event routed to ADC1 as TRGO |
+| DMA1 Channel 1 | ADC1 circular transfers, half/full interrupts |
+| USART1 | Nominal 115200 baud, transmit-only application path |
 
-| Peripheral | Configuration |
-|------------|---------------|
-| ADC1 | 12-bit, single channel, hardware triggered, DMA circular |
-| TIM1 | PSC=169, ARR=10000, TRGO on Update Event → 100 Hz |
-| DMA1 Ch1 | Circular, 16-bit peripheral and memory, HTIE + TCIE |
-| USART2 | 115200 baud, TX only, BRR=16 (from PLLP clock) |
-| DMAMUX1 Ch0 | Request input = 5 (ADC1) routed to DMA1 Ch1 |
+**Nucleo VCP note:** The project’s `.ioc` file maps the onboard ST-LINK virtual COM port to LPUART1 on PA2/PA3, but this firmware outputs through USART1 on PA9. For the current firmware, connect an external USB-UART adapter to PA9 and GND. Use a 3.3 V-compatible adapter.
 
----
+## RTOS configuration
 
-## Clock Configuration
+- FreeRTOS kernel with the GCC ARM Cortex-M4F port.
+- 1 kHz RTOS tick.
+- Acquisition task: priority 3; waits on DMA task notifications.
+- UART task: priority 2; waits on a queue of eight packets.
+- DMA interrupt priority is set to the FreeRTOS syscall-safe priority.
+- FreeRTOS heap: 8 KiB using `heap_4.c`.
 
-The system runs on HSI (16 MHz) through the PLL at full 170 MHz:
+## Build and flash
 
-```
-HSI (16 MHz)
-  └── PLL (PLLM=4, PLLN=85, PLLR=2)
-        ├── SYSCLK  = 170 MHz
-        ├── HCLK    = 170 MHz
-        ├── APB1    = 170 MHz  (TIM1, USART2)
-        └── PLLP    = 42.5 MHz (ADC kernel clock)
-                       └── ADC12SEL = 1 (PLLP) in RCC->CCIPR
-```
+The project uses the included Makefile and requires `arm-none-eabi-gcc`, GNU Make, and OpenOCD (for flashing).
 
-> **Important:** On STM32G4, `ADC12SEL` must be set to `1` (PLLP). Value `3` is reserved and leaves the ADC with no clock.
-
----
-
-## Getting Started
-
-### Requirements
-
-- STM32G431 board (e.g. NUCLEO-G431RB)
-- ST-Link programmer
-- USB-to-UART adapter connected to PA2
-- Python 3.x with `pyserial`
-
-### 1. Build and Flash
-
-Open the project in **STM32CubeIDE**, build, and flash via ST-Link.
-
-Alternatively with `arm-none-eabi-gcc` and OpenOCD:
-```bash
+```sh
 make
+```
+
+The build outputs are `build/Testtt.elf`, `build/Testtt.hex`, and `build/Testtt.bin`. To flash with OpenOCD and an ST-Link:
+
+```sh
 openocd -f interface/stlink.cfg -f target/stm32g4x.cfg \
-        -c "program build/output.elf verify reset exit"
+  -c "program build/Testtt.elf verify reset exit"
 ```
 
-### 2. Verify Firmware
+If the ARM GCC tools are not on `PATH`, pass their `bin` directory through the Makefile’s `GCC_PATH` variable:
 
-Open Docklight or any serial terminal at **115200 baud**. On boot you should see:
-```
-ABC
-```
-These three bytes are sent at startup as an alive check. If you see them, clocking, GPIO, and USART are all working correctly.
-
-### 3. Run the Decoder
-
-```bash
-pip install pyserial
-python decoder.py
+```sh
+make GCC_PATH="/path/to/arm-none-eabi/bin"
 ```
 
----
+## Host decoder
 
-## Python Decoder
+Install the Python serial dependency and run the included decoder:
 
-`decoder.py` runs on the host and decodes the binary packet stream:
-
-```python
-import serial
-import struct
-
-SYNC_BYTE    = ord('#')
-PAYLOAD_SIZE = 8
-PACKET_SIZE  = 1 + PAYLOAD_SIZE + 1  # 10 bytes
-
-def compute_checksum(payload):
-    checksum = 0
-    for b in payload:
-        checksum ^= b
-    return checksum
-
-def decode_packets(port, baud=115200):
-    with serial.Serial(port, baud, timeout=2) as ser:
-        print(f"Listening on {port} at {baud} baud...\n")
-        while True:
-            byte = ser.read(1)
-            if not byte:
-                continue
-            if byte[0] != SYNC_BYTE:
-                print(f"[SYNC LOST] Got 0x{byte[0]:02X}, re-syncing...")
-                continue
-            rest = ser.read(PAYLOAD_SIZE + 1)
-            if len(rest) < PAYLOAD_SIZE + 1:
-                print("[ERROR] Incomplete packet, skipping...")
-                continue
-            payload           = rest[:PAYLOAD_SIZE]
-            received_checksum = rest[PAYLOAD_SIZE]
-            expected_checksum = compute_checksum(payload)
-            if received_checksum != expected_checksum:
-                print(f"[CHECKSUM FAIL] Expected 0x{expected_checksum:02X}, "
-                      f"got 0x{received_checksum:02X}")
-                continue
-            samples = struct.unpack('<4H', payload)
-            print(f"CH0: {samples[0]:5d}  CH1: {samples[1]:5d}  "
-                  f"CH2: {samples[2]:5d}  CH3: {samples[3]:5d}")
-
-if __name__ == "__main__":
-    decode_packets(port="COM3", baud=115200)  # Change port as needed
+```sh
+python -m pip install pyserial
+python decode.py
 ```
 
-**Change the port** at the bottom to match your system:
+Edit the `COM4` port in `decode.py` to match the serial adapter on your computer. Use 115200 baud. The decoder searches for the sync byte, reads the fixed-size packet, checks the XOR checksum, and prints valid sample groups.
 
-| OS      | Example                   |
-|---------|---------------------------|
-| Windows | `COM3`, `COM4`, ...       |
-| Linux   | `/dev/ttyUSB0`            |
-| macOS   | `/dev/tty.usbmodem...`    |
+Example:
 
-**Example output:**
-```
-Listening on COM3 at 115200 baud...
+```text
+Listening on COM4 at 115200 baud...
 
-CH0:  2048  CH1:  3210  CH2:  1987  CH3:  4001
-CH0:  2051  CH1:  3208  CH2:  1990  CH3:  4003
-CH0:  2047  CH1:  3211  CH2:  1985  CH3:  4005
+S0:  2048  S1:  2051  S2:  2047  S3:  2050
 ```
 
----
+## Project structure
 
-## File Structure
-
-```
-stm32-adc-dma-uart-logger/
+```text
+Testtt/
 ├── Core/
-│   ├── Src/
-│   │   └── main.c          # All firmware: ADC, DMA, TIM1, USART2, packet TX
-│   └── Inc/
-│       └── main.h          # Pin definitions, error handler declaration
-├── Drivers/                # STM32 HAL (CubeIDE generated)
-├── decoder.py              # Python host-side packet decoder
-└── README.md
+│   ├── Inc/
+│   │   └── FreeRTOSConfig.h
+│   └── Src/
+│       ├── main.c                 # ADC/DMA setup and FreeRTOS tasks
+│       └── stm32g4xx_it.c         # DMA and RTOS exception handlers
+├── Drivers/                       # STM32 CMSIS and HAL device support
+├── Middlewares/Third_Party/FreeRTOS/Source/
+│   ├── include/
+│   └── portable/GCC/ARM_CM4F/     # FreeRTOS Cortex-M4F port
+├── decode.py                      # Host-side serial packet decoder
+├── Makefile
+├── STM32G431XX_FLASH.ld
+└── startup_stm32g431xx.s
 ```
-
----
-
 
 ## License
 
-MIT — do whatever you want with it.
+The application README describes the project as MIT-licensed. The vendored FreeRTOS files retain their upstream license in `Middlewares/Third_Party/FreeRTOS/Source/LICENSE`.
