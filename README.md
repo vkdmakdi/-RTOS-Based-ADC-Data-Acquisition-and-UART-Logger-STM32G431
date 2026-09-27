@@ -30,11 +30,11 @@ TIM2 TRGO at 1 kHz --> ADC1 channel 1 --> DMA1 Channel 1 circular buffer [8]
                                                   |
                                      Packet queue (8 packets)
                                                   |
-                                     UART task (priority 2)
+                                           UART task (priority 2)
                                                   |
-                                      USART1 TX, PA9
+                                            USART1 TX, PA9
                                                   |
-                                       Host decode.py
+                                             Host decode.py
 ```
 
 ### Firmware sequence
@@ -142,7 +142,3 @@ Testtt/
 ├── STM32G431XX_FLASH.ld
 └── startup_stm32g431xx.s
 ```
-
-## License
-
-The application README describes the project as MIT-licensed. The vendored FreeRTOS files retain their upstream license in `Middlewares/Third_Party/FreeRTOS/Source/LICENSE`.
